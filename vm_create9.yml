@@ -1,0 +1,176 @@
+---
+- name: Clone QCOW2 Image, Create VM, Fetch IP & Add to Guacamole
+  hosts: localhost
+  become: yes
+  vars_prompt:
+    - name: "vm_name"
+      prompt: "Enter the VM name"
+      default: "test-vm"
+      private: no
+
+    - name: "vm_ram"
+      prompt: "Enter the amount of RAM for the VM (in MB)"
+      default: 2048
+      private: no
+
+    - name: "vm_cpu"
+      prompt: "Enter the number of CPUs for the VM"
+      default: 2
+      private: no
+
+    - name: "base_qcow_image"
+      prompt: "Enter the path to the base QCOW2 image"
+      default: "/var/lib/libvirt/images/ubuntu24-Main.qcow2"
+      private: no
+
+    - name: "vm_username"
+      prompt: "Enter the main username for VM"
+      default: "diksha"
+      private: no
+
+    - name: "vm_password"
+      prompt: "Enter the password for main user"
+      private: yes
+
+    - name: "new_username"
+      prompt: "Enter the new user to create in VM"
+      default: "newuser"
+      private: no
+
+    - name: "new_user_password"
+      prompt: "Enter the password for new user"
+      private: yes
+
+  vars:
+    new_qcow_image: "/var/lib/libvirt/images/{{ vm_name }}.qcow2"
+    cloud_init_iso: "/var/lib/libvirt/images/{{ vm_name }}-seed.iso"
+    network_name: "default"
+    guac_url: "http://localhost:8989/guacamole"
+    guac_admin_user: "guacadmin"
+    guac_admin_pass: "guacadmin"
+
+  tasks:
+    - name: Ensure images directory exists
+      file:
+        path: /var/lib/libvirt/images
+        state: directory
+        mode: '0755'
+
+    - name: Create Cloud-Init user-data file
+      copy:
+        dest: "/var/lib/libvirt/images/user-data"
+        content: |
+          #cloud-config
+          users:
+            - name: {{ vm_username }}
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              groups: sudo
+              shell: /bin/bash
+              lock_passwd: false
+              passwd: {{ vm_password | password_hash('sha512') }}
+          ssh_pwauth: true
+          disable_root: false
+          chpasswd:
+            list: |
+              {{ vm_username }}:{{ vm_password }}
+            expire: False
+
+    - name: Generate Cloud-Init ISO
+      command: cloud-localds "{{ cloud_init_iso }}" "/var/lib/libvirt/images/user-data"
+
+    - name: Clone the QCOW2 image
+      shell: qemu-img convert -O qcow2 "{{ base_qcow_image }}" "{{ new_qcow_image }}"
+      args:
+        creates: "{{ new_qcow_image }}"
+
+    - name: Generate a random MAC address
+      shell: "echo 52:54:00:$(openssl rand -hex 3 | sed 's/\(..\)/\1:/g; s/:$//')"
+      register: mac_address
+
+    - name: Display generated MAC address
+      debug:
+        msg: "Generated MAC Address: {{ mac_address.stdout }}"
+
+    - name: Create VM with Cloud-Init ISO
+      shell: |
+        virt-install \
+        --name {{ vm_name }} \
+        --ram {{ vm_ram }} \
+        --vcpus {{ vm_cpu }} \
+        --disk path={{ new_qcow_image }},format=qcow2 \
+        --disk path={{ cloud_init_iso }},device=cdrom \
+        --os-variant ubuntu20.04 \
+        --network network={{ network_name }},mac={{ mac_address.stdout }},model=virtio \
+        --import \
+        --graphics vnc \
+        --noautoconsole
+
+    - name: Wait for the VM to start
+      pause:
+        seconds: 10
+
+    - name: Fetch VM IP Address from DHCP Leases
+      shell: "virsh net-dhcp-leases {{ network_name }} | grep '{{ mac_address.stdout }}' | awk '{print $5}' | cut -d'/' -f1"
+      register: vm_ip
+      until: vm_ip.stdout != ""
+      retries: 10
+      delay: 5
+
+    - name: Display VM IP Address
+      debug:
+        msg: "VM {{ vm_name }} is running at IP: {{ vm_ip.stdout }}"
+
+    - name: Authenticate with Guacamole API
+      uri:
+        url: "{{ guac_url }}/api/tokens"
+        method: POST
+        headers:
+          Content-Type: "application/x-www-form-urlencoded"
+        body: "username={{ guac_admin_user }}&password={{ guac_admin_pass }}"
+        body_format: form-urlencoded
+        return_content: yes
+      register: guac_token_response
+
+    - name: Extract Guacamole Token
+      set_fact:
+        guac_token: "{{ guac_token_response.json.authToken }}"
+
+    - name: Create SSH Connection in Guacamole
+      uri:
+        url: "{{ guac_url }}/api/session/data/postgresql/connections?token={{ guac_token }}"
+        method: POST
+        headers:
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "{{ vm_name }}-SSH"
+          protocol: "ssh"
+          parameters:
+            hostname: "{{ vm_ip.stdout }}"
+            port: "22"
+            username: "{{ vm_username }}"
+            password: "{{ vm_password }}"
+          attributes: {}
+        return_content: yes
+      register: guac_connection_response
+
+    - name: Extract Guacamole Connection ID
+      set_fact:
+        guac_connection_id: "{{ guac_connection_response.json.identifier }}"
+
+    - name: Display Guacamole Connection ID
+      debug:
+        msg: "Guacamole Connection ID for {{ vm_name }}: {{ guac_connection_id }}"
+
+    - name: Assign new user to VM in Guacamole
+      uri:
+        url: "{{ guac_url }}/api/session/data/postgresql/connectionGroups/ROOT/connections/{{ guac_connection_id }}?token={{ guac_token }}"
+        method: PUT
+        headers:
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          user: "{{ new_username }}"
+          permission: "READ"
+        return_content: yes
+
